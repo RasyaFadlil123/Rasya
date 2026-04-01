@@ -1,0 +1,105 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Unique build id
+        required: true
+        type: string
+      zip_path:
+        description: Path ZIP in repository
+        required: true
+        type: string
+      apk_name:
+        description: Output APK file name
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate ZIP path
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ github.event.inputs.zip_path }}"
+
+      - name: Prepare source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf workdir
+          mkdir -p workdir/source
+          unzip -q "${{ github.event.inputs.zip_path }}" -d workdir/source
+
+          if [ -f workdir/source/pubspec.yaml ]; then
+            echo "PROJECT_DIR=workdir/source" >> $GITHUB_ENV
+          else
+            found=$(find workdir/source -maxdepth 3 -type f -name pubspec.yaml | head -n 1 || true)
+            if [ -z "$found" ]; then
+              echo "pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter."
+              exit 1
+            fi
+            echo "PROJECT_DIR=$(dirname "$found")" >> $GITHUB_ENV
+          fi
+
+      - name: Flutter doctor
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter build apk --release
+          out=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name '*.apk' | head -n 1 || true)
+          if [ -z "$out" ]; then
+            echo "APK output tidak ditemukan"
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/build-output"
+          cp "$out" "$GITHUB_WORKSPACE/build-output/${{ github.event.inputs.apk_name }}"
+
+      - name: Delete old release if exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set +e
+          gh release delete "build-${{ github.event.inputs.build_id }}" --yes
+          git push origin :refs/tags/"build-${{ github.event.inputs.build_id }}"
+          exit 0
+
+      - name: Create release and upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.event.inputs.build_id }}
+          name: Build ${{ github.event.inputs.build_id }}
+          files: build-output/${{ github.event.inputs.apk_name }}
