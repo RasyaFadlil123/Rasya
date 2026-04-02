@@ -17,161 +17,124 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Prepare workspace without marketplace actions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/repo" "$GITHUB_WORKSPACE/build-output" "$GITHUB_WORKSPACE/build-logs"
+          git config --global init.defaultBranch "$REF_NAME"
+          cd "$GITHUB_WORKSPACE/repo"
+          git init
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git fetch --depth=1 origin "$REF_NAME"
+          git checkout -B "$REF_NAME" FETCH_HEAD
+          echo "REPO_DIR=$GITHUB_WORKSPACE/repo" >> "$GITHUB_ENV"
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Install Flutter SDK manually
+      - name: Install Java 17
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/flutter"
-          cd "$RUNNER_TEMP/flutter"
-          curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json -o releases.json
-          FLUTTER_ARCHIVE=$(python3 - <<'PY'
-            import json
-            with open('releases.json', 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            base = data['base_url']
-            current = data['current_release']['stable']
-            release = next(item for item in data['releases'] if item['hash'] == current)
-            print(f"{base}/{release['archive']}")
-            PY
-          )
-          echo "Downloading: $FLUTTER_ARCHIVE"
-          curl -fL "$FLUTTER_ARCHIVE" -o flutter.tar.xz
-          tar -xf flutter.tar.xz
-          echo "$RUNNER_TEMP/flutter/flutter/bin" >> "$GITHUB_PATH"
-          echo "$RUNNER_TEMP/flutter/flutter/bin/cache/dart-sdk/bin" >> "$GITHUB_PATH"
-          flutter --version
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk curl unzip xz-utils zip git
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "/usr/lib/jvm/java-17-openjdk-amd64/bin" >> "$GITHUB_PATH"
 
-      - name: Build with captured logs
-        id: build_step
+      - name: Install Flutter stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          rm -rf flutter-sdk flutter.tar.xz
+          curl -L --retry 5 --retry-delay 5 https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_3.29.3-stable.tar.xz -o flutter.tar.xz
+          mkdir -p flutter-sdk
+          tar -xf flutter.tar.xz -C flutter-sdk
+          echo "$RUNNER_TEMP/flutter-sdk/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Validate ZIP path
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$REPO_DIR/${{ github.event.inputs.zip_path }}"
+
+      - name: Prepare source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/source-unzip"
+          mkdir -p "$RUNNER_TEMP/source-unzip"
+          unzip -q "$REPO_DIR/${{ github.event.inputs.zip_path }}" -d "$RUNNER_TEMP/source-unzip" 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/unzip.log"
+          if [ -f "$RUNNER_TEMP/source-unzip/pubspec.yaml" ]; then
+            echo "PROJECT_DIR=$RUNNER_TEMP/source-unzip" >> "$GITHUB_ENV"
+          else
+            found=$(find "$RUNNER_TEMP/source-unzip" -maxdepth 4 -type f -name pubspec.yaml | head -n 1 || true)
+            if [ -z "$found" ]; then
+              echo "pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter." | tee "$GITHUB_WORKSPACE/build-logs/validation.log"
+              exit 1
+            fi
+            echo "PROJECT_DIR=$(dirname "$found")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Flutter doctor
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter doctor -v 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-doctor.log"
+
+      - name: Flutter pub get
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -o pipefail
+          flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+
+      - name: Build APK
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          flutter build apk --release 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+          out=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*.apk" | head -n 1 || true)
+          if [ -z "$out" ]; then
+            echo "APK output tidak ditemukan" | tee "$GITHUB_WORKSPACE/build-logs/apk-missing.log"
+            exit 1
+          fi
+          cp "$out" "$GITHUB_WORKSPACE/build-output/${{ github.event.inputs.apk_name }}"
+
+      - name: Pack build logs
+        if: always()
         shell: bash
         run: |
           set +e
-          export BUILD_ID="${{ github.event.inputs.build_id }}"
-          export ZIP_PATH="${{ github.event.inputs.zip_path }}"
-          export APK_NAME="${{ github.event.inputs.apk_name }}"
-          export GITHUB_WORKSPACE="${GITHUB_WORKSPACE}"
+          cd "$GITHUB_WORKSPACE"
+          zip -r "build-output/build-logs-${{ github.event.inputs.build_id }}.zip" build-logs >/dev/null 2>&1 || true
 
-          rm -rf workdir build-output logs
-          mkdir -p workdir/source build-output logs
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.inputs.build_id }}
+          path: ${{ github.workspace }}/build-output/${{ github.event.inputs.apk_name }}
+          if-no-files-found: error
+          retention-days: 7
 
-          run_and_capture() {
-            local name="$1"
-            shift
-            echo "===== ${name} =====" | tee -a logs/summary.txt
-            bash -lc "$*" > >(tee "logs/${name}.log") 2>&1
-            local code=$?
-            echo "exit_code=${code}" | tee -a "logs/${name}.meta"
-            echo "status=${name}:${code}" | tee -a logs/summary.txt
-            return $code
-          }
-
-          FINAL_CODE=0
-          PROJECT_DIR=""
-
-          run_and_capture validate_zip "test -f "${ZIP_PATH}"" || FINAL_CODE=$?
-
-          if [ $FINAL_CODE -eq 0 ]; then
-            run_and_capture unzip_source "unzip -o -q "${ZIP_PATH}" -d workdir/source" || FINAL_CODE=$?
-          fi
-
-          if [ $FINAL_CODE -eq 0 ]; then
-            if [ -f workdir/source/pubspec.yaml ]; then
-              PROJECT_DIR="workdir/source"
-            else
-              FOUND=$(find workdir/source -maxdepth 5 -type f -name pubspec.yaml | head -n 1 || true)
-              if [ -n "$FOUND" ]; then
-                PROJECT_DIR=$(dirname "$FOUND")
-              else
-                echo "pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter." | tee logs/project_detect.log
-                FINAL_CODE=1
-              fi
-            fi
-          fi
-
-          if [ -n "$PROJECT_DIR" ]; then
-            echo "PROJECT_DIR=$PROJECT_DIR" | tee -a logs/summary.txt
-          fi
-
-          if [ $FINAL_CODE -eq 0 ]; then
-            run_and_capture flutter_doctor "cd "$PROJECT_DIR" && flutter doctor -v" || FINAL_CODE=$?
-          fi
-
-          if [ $FINAL_CODE -eq 0 ]; then
-            run_and_capture flutter_pub_get "cd "$PROJECT_DIR" && flutter pub get" || FINAL_CODE=$?
-          fi
-
-          if [ $FINAL_CODE -eq 0 ]; then
-            run_and_capture flutter_build_apk "cd "$PROJECT_DIR" && flutter build apk --release" || FINAL_CODE=$?
-          fi
-
-          if [ $FINAL_CODE -eq 0 ]; then
-            APK_PATH=$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name "*.apk" | head -n 1 || true)
-            if [ -z "$APK_PATH" ]; then
-              echo "APK output tidak ditemukan" | tee logs/apk_find.log
-              FINAL_CODE=1
-            else
-              cp "$APK_PATH" "$GITHUB_WORKSPACE/build-output/${APK_NAME}"
-            fi
-          fi
-
-          {
-            echo "build_id=${BUILD_ID}"
-            echo "zip_path=${ZIP_PATH}"
-            echo "project_dir=${PROJECT_DIR}"
-            echo "final_code=${FINAL_CODE}"
-          } >> logs/summary.txt
-
-          if [ $FINAL_CODE -ne 0 ]; then
-            echo "Build gagal dengan kode $FINAL_CODE" | tee -a logs/summary.txt
-          else
-            echo "Build sukses" | tee -a logs/summary.txt
-          fi
-
-          exit $FINAL_CODE
-
-      - name: Upload build logs
+      - name: Upload build logs artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ github.event.inputs.build_id }}
-          path: logs/
+          name: logs-${{ github.event.inputs.build_id }}
+          path: ${{ github.workspace }}/build-output/build-logs-${{ github.event.inputs.build_id }}.zip
           if-no-files-found: warn
-          compression-level: 0
-
-      - name: Delete old release if exists
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set +e
-          gh release delete "build-${{ github.event.inputs.build_id }}" --yes
-          git push origin :refs/tags/"build-${{ github.event.inputs.build_id }}"
-          exit 0
-
-      - name: Create release and upload APK
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release create "build-${{ github.event.inputs.build_id }}" "build-output/${{ github.event.inputs.apk_name }}" --title "Build ${{ github.event.inputs.build_id }}" --notes "APK build otomatis"
+          retention-days: 7
