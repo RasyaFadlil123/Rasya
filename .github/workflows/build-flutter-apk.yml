@@ -18,11 +18,12 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -34,60 +35,129 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Validate ZIP path
+      - name: Install Flutter SDK manually
         shell: bash
         run: |
           set -euo pipefail
-          test -f "${{ github.event.inputs.zip_path }}"
+          mkdir -p "$RUNNER_TEMP/flutter"
+          cd "$RUNNER_TEMP/flutter"
+          curl -fsSL https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json -o releases.json
+          FLUTTER_ARCHIVE=$(python3 - <<'PY'
+            import json
+            with open('releases.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            base = data['base_url']
+            current = data['current_release']['stable']
+            release = next(item for item in data['releases'] if item['hash'] == current)
+            print(f"{base}/{release['archive']}")
+            PY
+          )
+          echo "Downloading: $FLUTTER_ARCHIVE"
+          curl -fL "$FLUTTER_ARCHIVE" -o flutter.tar.xz
+          tar -xf flutter.tar.xz
+          echo "$RUNNER_TEMP/flutter/flutter/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/flutter/flutter/bin/cache/dart-sdk/bin" >> "$GITHUB_PATH"
+          flutter --version
 
-      - name: Prepare source
+      - name: Build with captured logs
+        id: build_step
         shell: bash
         run: |
-          set -euo pipefail
-          rm -rf workdir
-          mkdir -p workdir/source
-          unzip -q "${{ github.event.inputs.zip_path }}" -d workdir/source
+          set +e
+          export BUILD_ID="${{ github.event.inputs.build_id }}"
+          export ZIP_PATH="${{ github.event.inputs.zip_path }}"
+          export APK_NAME="${{ github.event.inputs.apk_name }}"
+          export GITHUB_WORKSPACE="${GITHUB_WORKSPACE}"
 
-          if [ -f workdir/source/pubspec.yaml ]; then
-            echo "PROJECT_DIR=workdir/source" >> $GITHUB_ENV
-          else
-            found=$(find workdir/source -maxdepth 3 -type f -name pubspec.yaml | head -n 1 || true)
-            if [ -z "$found" ]; then
-              echo "pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter."
-              exit 1
+          rm -rf workdir build-output logs
+          mkdir -p workdir/source build-output logs
+
+          run_and_capture() {
+            local name="$1"
+            shift
+            echo "===== ${name} =====" | tee -a logs/summary.txt
+            bash -lc "$*" > >(tee "logs/${name}.log") 2>&1
+            local code=$?
+            echo "exit_code=${code}" | tee -a "logs/${name}.meta"
+            echo "status=${name}:${code}" | tee -a logs/summary.txt
+            return $code
+          }
+
+          FINAL_CODE=0
+          PROJECT_DIR=""
+
+          run_and_capture validate_zip "test -f "${ZIP_PATH}"" || FINAL_CODE=$?
+
+          if [ $FINAL_CODE -eq 0 ]; then
+            run_and_capture unzip_source "unzip -o -q "${ZIP_PATH}" -d workdir/source" || FINAL_CODE=$?
+          fi
+
+          if [ $FINAL_CODE -eq 0 ]; then
+            if [ -f workdir/source/pubspec.yaml ]; then
+              PROJECT_DIR="workdir/source"
+            else
+              FOUND=$(find workdir/source -maxdepth 5 -type f -name pubspec.yaml | head -n 1 || true)
+              if [ -n "$FOUND" ]; then
+                PROJECT_DIR=$(dirname "$FOUND")
+              else
+                echo "pubspec.yaml tidak ditemukan. Pastikan ZIP berisi project Flutter." | tee logs/project_detect.log
+                FINAL_CODE=1
+              fi
             fi
-            echo "PROJECT_DIR=$(dirname "$found")" >> $GITHUB_ENV
           fi
 
-      - name: Flutter doctor
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter doctor -v
-
-      - name: Get dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
-
-      - name: Build APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          flutter build apk --release
-          out=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name '*.apk' | head -n 1 || true)
-          if [ -z "$out" ]; then
-            echo "APK output tidak ditemukan"
-            exit 1
+          if [ -n "$PROJECT_DIR" ]; then
+            echo "PROJECT_DIR=$PROJECT_DIR" | tee -a logs/summary.txt
           fi
-          mkdir -p "$GITHUB_WORKSPACE/build-output"
-          cp "$out" "$GITHUB_WORKSPACE/build-output/${{ github.event.inputs.apk_name }}"
+
+          if [ $FINAL_CODE -eq 0 ]; then
+            run_and_capture flutter_doctor "cd "$PROJECT_DIR" && flutter doctor -v" || FINAL_CODE=$?
+          fi
+
+          if [ $FINAL_CODE -eq 0 ]; then
+            run_and_capture flutter_pub_get "cd "$PROJECT_DIR" && flutter pub get" || FINAL_CODE=$?
+          fi
+
+          if [ $FINAL_CODE -eq 0 ]; then
+            run_and_capture flutter_build_apk "cd "$PROJECT_DIR" && flutter build apk --release" || FINAL_CODE=$?
+          fi
+
+          if [ $FINAL_CODE -eq 0 ]; then
+            APK_PATH=$(find "$PROJECT_DIR/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name "*.apk" | head -n 1 || true)
+            if [ -z "$APK_PATH" ]; then
+              echo "APK output tidak ditemukan" | tee logs/apk_find.log
+              FINAL_CODE=1
+            else
+              cp "$APK_PATH" "$GITHUB_WORKSPACE/build-output/${APK_NAME}"
+            fi
+          fi
+
+          {
+            echo "build_id=${BUILD_ID}"
+            echo "zip_path=${ZIP_PATH}"
+            echo "project_dir=${PROJECT_DIR}"
+            echo "final_code=${FINAL_CODE}"
+          } >> logs/summary.txt
+
+          if [ $FINAL_CODE -ne 0 ]; then
+            echo "Build gagal dengan kode $FINAL_CODE" | tee -a logs/summary.txt
+          else
+            echo "Build sukses" | tee -a logs/summary.txt
+          fi
+
+          exit $FINAL_CODE
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.event.inputs.build_id }}
+          path: logs/
+          if-no-files-found: warn
+          compression-level: 0
 
       - name: Delete old release if exists
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -98,8 +168,10 @@ jobs:
           exit 0
 
       - name: Create release and upload APK
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.event.inputs.build_id }}
-          name: Build ${{ github.event.inputs.build_id }}
-          files: build-output/${{ github.event.inputs.apk_name }}
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "build-${{ github.event.inputs.build_id }}" "build-output/${{ github.event.inputs.apk_name }}" --title "Build ${{ github.event.inputs.build_id }}" --notes "APK build otomatis"
